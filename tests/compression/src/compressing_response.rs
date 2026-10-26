@@ -303,6 +303,15 @@ async fn server_replying_with_unsupported_encoding(encoding: CompressionEncoding
         status.message(),
         "Content is compressed with `br` which isn't supported"
     );
+    let error = std::error::Error::source(&status)
+        .unwrap()
+        .downcast_ref::<tonic::codec::CompressionError>()
+        .unwrap();
+    assert_eq!(error.received(), b"br");
+    assert_eq!(
+        error.reason(),
+        tonic::codec::CompressionErrorReason::Unsupported
+    );
 }
 
 util::parametrized_tests! {

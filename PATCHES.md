@@ -34,12 +34,16 @@ versions, and its independent Python peer exercises zstd on the wire.
 checkpoint for request and response compression. Its private construction of
 `codec::CompressionError` keeps the first received header's bytes and an
 `Unsupported` reason in the Status error source. Unknown and disabled encodings
-retain Code::Unimplemented and the accepted-encoding response metadata. Status
-text describes the refusal without formatting received bytes.
+retain Code::Unimplemented and the accepted-encoding response metadata. UTF-8 header values retain upstream's existing refusal message. Only non-UTF-8
+values use a fixed safe message; both cases attach the same typed source.
 
 Boundless reads this source instead of repeating Tonic's acceptance rules.
 Regression: `codec::compression::tests::refused_encoding_retains_typed_bytes_and_reason`
 checks unknown, disabled and non-UTF-8 values, identity and enabled gzip;
 `cargo test -p tonic --lib --features gzip,deflate,zstd -- codec::` and
-`cargo test -p compression` exercise the existing codec and compression paths.
+`cargo test -p compression` exercise the existing codec and compression paths
+(7 codec and 63 compression tests passed on macOS arm64). The compression
+response fixture also reads the public typed source; request and client-stream
+fixtures retain upstream's UTF-8 refusal text after its wire round trip.
+The checkpoint regression checks both message paths and their typed sources.
 Retire when upstream exposes equivalent structured refusal data.

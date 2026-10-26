@@ -42,7 +42,7 @@ impl CompressionError {
 
 impl fmt::Display for CompressionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Response compression rejected")
+        f.write_str("Compression rejected")
     }
 }
 
@@ -192,7 +192,13 @@ impl CompressionEncoding {
                     received: header_value.clone(),
                     reason: CompressionErrorReason::Unsupported,
                 };
-                let mut status = Status::unimplemented(error.to_string());
+                let message = match std::str::from_utf8(error.received()) {
+                    Ok(value) => {
+                        format!("Content is compressed with `{value}` which isn't supported")
+                    }
+                    Err(_) => error.to_string(),
+                };
+                let mut status = Status::unimplemented(message);
                 status.set_source(Arc::new(error));
 
                 let header_value = enabled_encodings
@@ -365,6 +371,11 @@ mod tests {
             )
             .unwrap_err();
             assert_eq!(status.code(), crate::Code::Unimplemented);
+            let expected = match std::str::from_utf8(value) {
+                Ok(value) => format!("Content is compressed with `{value}` which isn't supported"),
+                Err(_) => "Compression rejected".to_owned(),
+            };
+            assert_eq!(status.message(), expected);
             let error = status
                 .source()
                 .unwrap()
