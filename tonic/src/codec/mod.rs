@@ -10,7 +10,9 @@ use crate::Status;
 use std::io;
 
 pub use self::buffer::{DecodeBuf, EncodeBuf};
-pub use self::compression::{CompressionEncoding, EnabledCompressionEncodings};
+pub use self::compression::{
+    CompressionEncoding, CompressionError, CompressionErrorReason, EnabledCompressionEncodings,
+};
 pub use self::decode::Streaming;
 pub use self::encode::EncodeBody;
 

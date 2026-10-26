@@ -27,3 +27,19 @@ Regression evidence: `cargo test -p compression -- zstd` exercises request and
 response compression, negotiation, unary and streaming calls with the existing
 upstream fixtures: 21 passed on macOS arm64. Boundless's advisory gate checks the resolved dependency
 versions, and its independent Python peer exercises zstd on the wire.
+
+## Typed compression-header refusal (Boundless #375)
+
+`CompressionEncoding::from_encoding_header` remains the single acceptance
+checkpoint for request and response compression. Its private construction of
+`codec::CompressionError` keeps the first received header's bytes and an
+`Unsupported` reason in the Status error source. Unknown and disabled encodings
+retain Code::Unimplemented and the accepted-encoding response metadata. Status
+text describes the refusal without formatting received bytes.
+
+Boundless reads this source instead of repeating Tonic's acceptance rules.
+Regression: `codec::compression::tests::refused_encoding_retains_typed_bytes_and_reason`
+checks unknown, disabled and non-UTF-8 values, identity and enabled gzip;
+`cargo test -p tonic --lib --features gzip,deflate,zstd -- codec::` and
+`cargo test -p compression` exercise the existing codec and compression paths.
+Retire when upstream exposes equivalent structured refusal data.

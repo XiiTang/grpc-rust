@@ -4,12 +4,49 @@ use bytes::{Buf, BufMut, BytesMut};
 use flate2::read::{GzDecoder, GzEncoder};
 #[cfg(feature = "deflate")]
 use flate2::read::{ZlibDecoder, ZlibEncoder};
-use std::{borrow::Cow, fmt};
+use std::{fmt, sync::Arc};
 #[cfg(feature = "zstd")]
 use zstd::stream::read::{Decoder, Encoder};
 
 pub(crate) const ENCODING_HEADER: &str = "grpc-encoding";
 pub(crate) const ACCEPT_ENCODING_HEADER: &str = "grpc-accept-encoding";
+
+/// Why a received compression header was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionErrorReason {
+    /// The encoding is unknown or is not enabled for this call.
+    Unsupported,
+}
+
+/// A compression-header refusal, available through [`Status`]'s error source.
+///
+/// The codec alone constructs this error after applying the call's enabled
+/// encodings. Consumers can read the wire bytes without parsing status text.
+#[derive(Clone, Debug)]
+pub struct CompressionError {
+    received: http::HeaderValue,
+    reason: CompressionErrorReason,
+}
+
+impl CompressionError {
+    /// The first received `grpc-encoding` header value, as wire bytes.
+    pub fn received(&self) -> &[u8] {
+        self.received.as_bytes()
+    }
+
+    /// The codec's reason for refusing the header.
+    pub fn reason(&self) -> CompressionErrorReason {
+        self.reason
+    }
+}
+
+impl fmt::Display for CompressionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Response compression rejected")
+    }
+}
+
+impl std::error::Error for CompressionError {}
 
 /// Struct used to configure which encodings are enabled on a server or channel.
 ///
@@ -150,15 +187,13 @@ impl CompressionEncoding {
                 Ok(Some(CompressionEncoding::Zstd))
             }
             b"identity" => Ok(None),
-            other => {
-                let other = match std::str::from_utf8(other) {
-                    Ok(s) => Cow::Borrowed(s),
-                    Err(_) => Cow::Owned(format!("{other:?}")),
+            _ => {
+                let error = CompressionError {
+                    received: header_value.clone(),
+                    reason: CompressionErrorReason::Unsupported,
                 };
-
-                let mut status = Status::unimplemented(format!(
-                    "Content is compressed with `{other}` which isn't supported"
-                ));
+                let mut status = Status::unimplemented(error.to_string());
+                status.set_source(Arc::new(error));
 
                 let header_value = enabled_encodings
                     .into_accept_encoding_header_value()
@@ -313,6 +348,57 @@ mod tests {
     use http::HeaderValue;
 
     use super::*;
+
+    #[test]
+    fn refused_encoding_retains_typed_bytes_and_reason() {
+        use std::error::Error as _;
+
+        for value in [b"unknown".as_slice(), b"gzip", b"\xffzip"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                ENCODING_HEADER,
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+            let status = CompressionEncoding::from_encoding_header(
+                &headers,
+                EnabledCompressionEncodings::default(),
+            )
+            .unwrap_err();
+            assert_eq!(status.code(), crate::Code::Unimplemented);
+            let error = status
+                .source()
+                .unwrap()
+                .downcast_ref::<CompressionError>()
+                .unwrap();
+            assert_eq!(error.received(), value);
+            assert_eq!(error.reason(), CompressionErrorReason::Unsupported);
+            assert_eq!(
+                status.metadata().get(ACCEPT_ENCODING_HEADER).unwrap(),
+                "identity"
+            );
+        }
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(ENCODING_HEADER, http::HeaderValue::from_static("identity"));
+        assert_eq!(
+            CompressionEncoding::from_encoding_header(
+                &headers,
+                EnabledCompressionEncodings::default(),
+            )
+            .unwrap(),
+            None
+        );
+        #[cfg(feature = "gzip")]
+        {
+            headers.insert(ENCODING_HEADER, http::HeaderValue::from_static("gzip"));
+            let mut enabled = EnabledCompressionEncodings::default();
+            enabled.enable(CompressionEncoding::Gzip);
+            assert_eq!(
+                CompressionEncoding::from_encoding_header(&headers, enabled).unwrap(),
+                Some(CompressionEncoding::Gzip)
+            );
+        }
+    }
 
     #[test]
     fn convert_none_into_header_value() {
