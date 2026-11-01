@@ -47,3 +47,36 @@ response fixture also reads the public typed source; request and client-stream
 fixtures retain upstream's UTF-8 refusal text after its wire round trip.
 The checkpoint regression checks both message paths and their typed sources.
 Retire when upstream exposes equivalent structured refusal data.
+
+## A compressed message decodes only as complete coded data (Boundless #280)
+
+`codec::compression::decompress`, called only by the decoder's
+`decode_chunk`, is the single checkpoint for compressed messages in both
+directions. Upstream reads the message's `len` bytes with flate2's
+single-stream `GzDecoder` or `ZlibDecoder` through `std::io::copy`, then
+advances past all `len` bytes whether the decoder used them or not (upstream
+`master` `dccf644d` is unchanged). A gzip message holding a second member or
+trailing bytes therefore decodes as its first member only, and a deflate
+message decodes as whatever its zlib stream produced before the bytes ended:
+trailing bytes are dropped, and a stream cut short, even an empty one, is
+read as a complete, shorter message. The call then ends with the peer's
+`grpc-status: 0`.
+
+The patch keeps the signature, framing, size-limited writer and status
+conversion. gzip reads members in sequence (`MultiGzDecoder`), as RFC 1952
+defines a gzip file and grpc-go's multistream `gzip.Reader` reads to EOF;
+anything after the last member is an error. deflate inflates one zlib stream
+with `flate2::Decompress` and requires its stream end (Adler-32 checked) with
+every input byte used, as gRPC core's `ZlibBody` refuses "not all input
+consumed" and any end other than `Z_STREAM_END`. zstd is unchanged: its
+decoder already reads frames in sequence and refuses trailing or cut data.
+The decompressed-size limit still fails with `WriteZero`, which the decoder
+maps to `resource_exhausted`; every other failure stays `Status::internal`.
+
+Regression: `codec::compression::tests::a_message_decodes_only_as_complete_coded_data`
+decodes, for each encoding, one stream, two streams, trailing garbage,
+trailing zeros, a cut checksum, a stream cut in half, an empty message and a
+message larger than one inflate chunk, and checks the size limit.
+`cargo test -p tonic --lib --features gzip,deflate,zstd -- codec::` (8 passed)
+and `cargo test -p compression` (63 passed) pass on macOS arm64. Retire when
+upstream checks that decoding used the whole message.

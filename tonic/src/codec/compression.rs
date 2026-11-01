@@ -1,9 +1,9 @@
 use crate::{Status, metadata::MetadataValue};
 use bytes::{Buf, BufMut, BytesMut};
-#[cfg(feature = "gzip")]
-use flate2::read::{GzDecoder, GzEncoder};
 #[cfg(feature = "deflate")]
-use flate2::read::{ZlibDecoder, ZlibEncoder};
+use flate2::read::ZlibEncoder;
+#[cfg(feature = "gzip")]
+use flate2::read::{GzEncoder, MultiGzDecoder};
 use std::{fmt, sync::Arc};
 #[cfg(feature = "zstd")]
 use zstd::stream::read::{Decoder, Encoder};
@@ -293,6 +293,11 @@ pub(crate) fn compress(
 }
 
 /// Decompress `len` bytes from `compressed_buf` into `out_buf`.
+///
+/// The `len` bytes must be complete coded data, used exactly: gzip members or
+/// zstd frames in sequence, or one zlib stream for deflate. Bytes after the
+/// end, a stream cut short and an empty message are errors, never a message
+/// made of what was decoded before them.
 #[allow(unused_variables, unreachable_code)]
 pub(crate) fn decompress(
     settings: CompressionSettings,
@@ -315,13 +320,14 @@ pub(crate) fn decompress(
     match settings.encoding {
         #[cfg(feature = "gzip")]
         CompressionEncoding::Gzip => {
-            let mut gzip_decoder = GzDecoder::new(&compressed_buf[0..len]);
+            // RFC 1952: a gzip file is a series of members. The multi-member
+            // reader reads each to its trailer and refuses what is not one.
+            let mut gzip_decoder = MultiGzDecoder::new(&compressed_buf[0..len]);
             std::io::copy(&mut gzip_decoder, &mut out_writer)?;
         }
         #[cfg(feature = "deflate")]
         CompressionEncoding::Deflate => {
-            let mut deflate_decoder = ZlibDecoder::new(&compressed_buf[0..len]);
-            std::io::copy(&mut deflate_decoder, &mut out_writer)?;
+            inflate_exactly(&compressed_buf[0..len], &mut out_writer)?;
         }
         #[cfg(feature = "zstd")]
         CompressionEncoding::Zstd => {
@@ -332,6 +338,45 @@ pub(crate) fn decompress(
 
     compressed_buf.advance(len);
 
+    Ok(())
+}
+
+/// One zlib stream, which must reach its end, Adler-32 checked, at the end of
+/// `input`, as gRPC core's `ZlibBody` requires. flate2's read decoder ends
+/// at the end of its input whether or not the stream did. Each step flushes
+/// nothing: miniz_oxide's `Finish` expects the whole output in one call.
+#[cfg(feature = "deflate")]
+fn inflate_exactly(input: &[u8], out_writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    use std::io::{Error, ErrorKind};
+    let mut inflater = Decompress::new(true);
+    let mut chunk = vec![0; 32 * 1024];
+    loop {
+        let (read, written) = (inflater.total_in(), inflater.total_out());
+        let used = usize::try_from(read).expect("input length fits usize");
+        let status = inflater
+            .decompress(&input[used..], &mut chunk, FlushDecompress::None)
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+        let produced =
+            usize::try_from(inflater.total_out() - written).expect("produced bytes fit the chunk");
+        out_writer.write_all(&chunk[..produced])?;
+        match status {
+            Status::StreamEnd => break,
+            _ if inflater.total_in() == read && produced == 0 => {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "deflate stream ends before its end",
+                ));
+            }
+            _ => {}
+        }
+    }
+    if inflater.total_in() != input.len() as u64 {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "data follows the end of the deflate stream",
+        ));
+    }
     Ok(())
 }
 
@@ -409,6 +454,100 @@ mod tests {
                 Some(CompressionEncoding::Gzip)
             );
         }
+    }
+
+    /// A message decodes only as complete coded data its bytes hold
+    /// exactly (Boundless #280).
+    #[cfg(all(feature = "gzip", feature = "deflate", feature = "zstd"))]
+    #[test]
+    fn a_message_decodes_only_as_complete_coded_data() {
+        use std::io::Write as _;
+
+        fn gzip(data: &[u8]) -> Vec<u8> {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        }
+        fn zlib(data: &[u8]) -> Vec<u8> {
+            let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        }
+        fn zstd(data: &[u8]) -> Vec<u8> {
+            zstd::encode_all(data, 3).unwrap()
+        }
+        fn decode(encoding: CompressionEncoding, input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+            let mut compressed = BytesMut::from(input);
+            let mut out = BytesMut::new();
+            decompress(
+                CompressionSettings {
+                    encoding,
+                    buffer_growth_interval: 8 * 1024,
+                },
+                &mut compressed,
+                (&mut out).limit(1024 * 1024),
+                input.len(),
+            )?;
+            assert!(compressed.is_empty(), "the message's bytes are used");
+            Ok(out.to_vec())
+        }
+
+        // A message larger than one inflate chunk decodes whole.
+        let large: Vec<u8> = (0..200_000u32).flat_map(|n| n.to_le_bytes()).collect();
+        type Encode = fn(&[u8]) -> Vec<u8>;
+        let encoders: [(CompressionEncoding, Encode, bool); 3] = [
+            (CompressionEncoding::Gzip, gzip, true),
+            (CompressionEncoding::Deflate, zlib, false),
+            (CompressionEncoding::Zstd, zstd, true),
+        ];
+        for (encoding, encode, continues) in encoders {
+            let first = encode(b"first");
+            let second = encode(b"second");
+            assert_eq!(decode(encoding, &first).unwrap(), b"first", "{encoding:?}");
+            assert_eq!(
+                decode(encoding, &encode(&large)).unwrap(),
+                large,
+                "{encoding:?}"
+            );
+            let two = decode(encoding, &[first.clone(), second].concat());
+            if continues {
+                assert_eq!(two.unwrap(), b"firstsecond", "{encoding:?}");
+            } else {
+                assert!(two.is_err(), "{encoding:?} two streams: {two:?}");
+            }
+            for (case, input) in [
+                (
+                    "trailing garbage",
+                    [first.clone(), b"garbage".to_vec()].concat(),
+                ),
+                ("trailing zeros", [first.clone(), vec![0; 8]].concat()),
+                ("checksum cut", first[..first.len() - 4].to_vec()),
+                ("cut to half", first[..first.len() / 2].to_vec()),
+                ("empty", Vec::new()),
+            ] {
+                let error = decode(encoding, &input).unwrap_err();
+                assert_ne!(
+                    error.kind(),
+                    std::io::ErrorKind::WriteZero,
+                    "{encoding:?} {case}"
+                );
+            }
+        }
+        // The decompressed-size limit still refuses as the limit.
+        let mut compressed = BytesMut::from(&zlib(&large)[..]);
+        let len = compressed.len();
+        let mut out = BytesMut::new();
+        let error = decompress(
+            CompressionSettings {
+                encoding: CompressionEncoding::Deflate,
+                buffer_growth_interval: 8 * 1024,
+            },
+            &mut compressed,
+            (&mut out).limit(1024),
+            len,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
     }
 
     #[test]
