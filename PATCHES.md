@@ -107,3 +107,21 @@ Regression coverage: the Boundless gRPC receive fixture exercises accepted
 an over-window second frame. It also sends a complete v0.7 raw-block frame.
 The Program observes the framing failure without a message or a successful
 Status from the refused reply.
+
+## Optional codec buffer admission (Boundless #769)
+
+The Boundless RawCodec opts into checks before moving any receive buffer,
+encoder batch or encoder input scratch. The receive budget can admit decoder
+state separately. The guarded codec yields an exact batch copy and has the
+decoder copy each message independently. The default codec path retains
+upstream's implicit BytesMut growth, sliced encode batches and decoded byte
+ownership. On opt-in, a failed receive admission returns a local Status before
+the allocation. Boundless preserves the typed cause in its call evidence. The
+same decompressed-size cap, complete-stream validation, frame batching, EOF,
+trailer handling and transport cancellation apply. Sending spends working and
+DATA credit already admitted by Boundless before the write answers.
+
+Regression coverage: Boundless's gRPC tests drive budget admission, coalesced
+and fragmented receives, compressed output limits, exact backing under HTTP/2
+backpressure, upload disposal and replay. The fork budget test checks one
+rejected move and verifies that a later admitted move keeps the unread bytes.

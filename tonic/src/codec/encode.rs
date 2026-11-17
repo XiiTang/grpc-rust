@@ -1,9 +1,11 @@
+use super::BufferKind;
+use super::budget::Buffer;
 use super::compression::{
     CompressionEncoding, CompressionSettings, SingleMessageCompressionOverride, compress,
 };
 use super::{BufferSettings, DEFAULT_MAX_SEND_MESSAGE_SIZE, EncodeBuf, Encoder, HEADER_SIZE};
 use crate::Status;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use http::HeaderMap;
 use http_body::{Body, Frame};
 use pin_project::pin_project;
@@ -26,8 +28,8 @@ struct EncodedBytes<T, U> {
     encoder: T,
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
-    buf: BytesMut,
-    uncompression_buf: BytesMut,
+    buf: Buffer,
+    uncompression_buf: Buffer,
     error: Option<Status>,
 }
 
@@ -40,7 +42,9 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
         max_message_size: Option<usize>,
     ) -> Self {
         let buffer_settings = encoder.buffer_settings();
-        let buf = BytesMut::with_capacity(buffer_settings.buffer_size);
+        let budget = encoder.buffer_budget();
+        let floor = buffer_settings.buffer_size;
+        let buf = Buffer::new(floor, floor, BufferKind::Send, budget.clone());
 
         let compression_encoding =
             if compression_override == SingleMessageCompressionOverride::Disable {
@@ -49,11 +53,16 @@ impl<T: Encoder, U: Stream> EncodedBytes<T, U> {
                 compression_encoding
             };
 
-        let uncompression_buf = if compression_encoding.is_some() {
-            BytesMut::with_capacity(buffer_settings.buffer_size)
-        } else {
-            BytesMut::new()
-        };
+        let uncompression_buf = Buffer::new(
+            if compression_encoding.is_some() {
+                floor
+            } else {
+                0
+            },
+            floor,
+            BufferKind::Uncompressed,
+            budget,
+        );
 
         Self {
             source: source.fuse(),
@@ -99,7 +108,7 @@ where
                     return Poll::Ready(None);
                 }
                 Poll::Pending | Poll::Ready(None) => {
-                    return Poll::Ready(Some(Ok(buf.split_to(buf.len()).freeze())));
+                    return Poll::Ready(Some(Ok(buf.take_batch())));
                 }
                 Poll::Ready(Some(Ok(item))) => {
                     if let Err(status) = encode_item(
@@ -115,7 +124,7 @@ where
                     }
 
                     if buf.len() >= buffer_settings.yield_threshold {
-                        return Poll::Ready(Some(Ok(buf.split_to(buf.len()).freeze())));
+                        return Poll::Ready(Some(Ok(buf.take_batch())));
                     }
                 }
                 Poll::Ready(Some(Err(status))) => {
@@ -123,7 +132,7 @@ where
                         return Poll::Ready(Some(Err(status)));
                     }
                     *error = Some(status);
-                    return Poll::Ready(Some(Ok(buf.split_to(buf.len()).freeze())));
+                    return Poll::Ready(Some(Ok(buf.take_batch())));
                 }
             }
         }
@@ -132,8 +141,8 @@ where
 
 fn encode_item<T>(
     encoder: &mut T,
-    buf: &mut BytesMut,
-    uncompression_buf: &mut BytesMut,
+    buf: &mut Buffer,
+    uncompression_buf: &mut Buffer,
     compression_encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
     buffer_settings: BufferSettings,
@@ -144,13 +153,13 @@ where
 {
     let offset = buf.len();
 
-    buf.reserve(HEADER_SIZE);
+    buf.prepare(HEADER_SIZE)?;
     unsafe {
-        buf.advance_mut(HEADER_SIZE);
+        buf.bytes.advance_mut(HEADER_SIZE);
     }
 
     if let Some(encoding) = compression_encoding {
-        uncompression_buf.clear();
+        uncompression_buf.bytes.clear();
 
         encoder
             .encode(item, &mut EncodeBuf::new(uncompression_buf))
@@ -175,7 +184,11 @@ where
     }
 
     // now that we know length, we can write the header
-    finish_encoding(compression_encoding, max_message_size, &mut buf[offset..])
+    finish_encoding(
+        compression_encoding,
+        max_message_size,
+        &mut buf.bytes[offset..],
+    )
 }
 
 fn finish_encoding(

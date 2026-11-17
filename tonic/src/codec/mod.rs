@@ -2,6 +2,7 @@
 //!
 //! This module contains the generic `Codec`, `Encoder` and `Decoder` traits.
 
+mod budget;
 mod buffer;
 pub(crate) mod compression;
 mod decode;
@@ -9,6 +10,7 @@ mod encode;
 use crate::Status;
 use std::io;
 
+pub use self::budget::{BufferBudget, BufferKind};
 pub use self::buffer::{DecodeBuf, EncodeBuf};
 pub use self::compression::{
     CompressionEncoding, CompressionError, CompressionErrorReason, EnabledCompressionEncodings,
@@ -134,6 +136,11 @@ pub trait Encoder {
     /// Encodes a message into the provided buffer.
     fn encode(&mut self, item: Self::Item, dst: &mut EncodeBuf<'_>) -> Result<(), Self::Error>;
 
+    /// Select guarded buffer allocation and independent message storage.
+    fn buffer_budget(&self) -> Option<std::sync::Arc<dyn BufferBudget>> {
+        None
+    }
+
     /// Controls how tonic creates and expands encode buffers.
     fn buffer_settings(&self) -> BufferSettings {
         BufferSettings::default()
@@ -154,6 +161,11 @@ pub trait Decoder {
     /// is no need to get the length from the bytes, gRPC framing is handled
     /// for you.
     fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error>;
+
+    /// Select guarded buffer allocation and independent message storage.
+    fn buffer_budget(&self) -> Option<std::sync::Arc<dyn BufferBudget>> {
+        None
+    }
 
     /// Controls how tonic creates and expands decode buffers.
     fn buffer_settings(&self) -> BufferSettings {

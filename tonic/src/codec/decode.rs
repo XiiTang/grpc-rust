@@ -1,7 +1,9 @@
+use super::BufferKind;
+use super::budget::{Buffer, append};
 use super::compression::{CompressionEncoding, CompressionSettings, decompress};
 use super::{BufferSettings, DEFAULT_MAX_RECV_MESSAGE_SIZE, DecodeBuf, Decoder, HEADER_SIZE};
 use crate::{Code, Status, body::Body, metadata::MetadataMap};
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::Buf;
 use http::{HeaderMap, StatusCode};
 use http_body::Body as HttpBody;
 use http_body_util::BodyExt;
@@ -28,9 +30,10 @@ struct StreamingInner {
     body: SyncWrapper<Body>,
     state: State,
     direction: Direction,
-    buf: BytesMut,
+    buf: Buffer,
     trailers: Option<HeaderMap>,
-    decompress_buf: BytesMut,
+    decompress_buf: Buffer,
+    receive_high: (usize, usize),
     encoding: Option<CompressionEncoding>,
     max_message_size: Option<usize>,
 }
@@ -123,6 +126,7 @@ impl<T> Streaming<T> {
         D: Decoder<Item = T, Error = Status> + Send + 'static,
     {
         let buffer_size = decoder.buffer_settings().buffer_size;
+        let budget = decoder.buffer_budget();
         Self {
             decoder: SyncWrapper::new(Box::new(decoder)),
             inner: StreamingInner {
@@ -134,9 +138,15 @@ impl<T> Streaming<T> {
                 )),
                 state: State::ReadHeader,
                 direction,
-                buf: BytesMut::with_capacity(buffer_size),
+                buf: Buffer::new(
+                    buffer_size,
+                    buffer_size,
+                    BufferKind::Receive,
+                    budget.clone(),
+                ),
                 trailers: None,
-                decompress_buf: BytesMut::new(),
+                decompress_buf: Buffer::new(0, buffer_size, BufferKind::Decompressed, budget),
+                receive_high: (0, 0),
                 encoding,
                 max_message_size,
             },
@@ -145,6 +155,19 @@ impl<T> Streaming<T> {
 }
 
 impl StreamingInner {
+    fn receive_limit(&mut self) -> Result<(), Status> {
+        if self.buf.guarded() {
+            let limit = self
+                .receive_high
+                .0
+                .checked_add(self.receive_high.1)
+                .and_then(|n| n.checked_add(self.buf.floor()))
+                .ok_or_else(|| Status::resource_exhausted("receive capacity overflow"))?;
+            self.buf.set_limit(limit);
+        }
+        Ok(())
+    }
+
     fn decode_chunk(
         &mut self,
         buffer_settings: BufferSettings,
@@ -154,7 +177,7 @@ impl StreamingInner {
                 return Ok(None);
             }
 
-            let compression_encoding = match self.buf.get_u8() {
+            let compression_encoding = match self.buf.bytes.get_u8() {
                 0 => None,
                 1 => {
                     {
@@ -186,7 +209,7 @@ impl StreamingInner {
                 }
             };
 
-            let len = self.buf.get_u32() as usize;
+            let len = self.buf.bytes.get_u32() as usize;
             let limit = self
                 .max_message_size
                 .unwrap_or(DEFAULT_MAX_RECV_MESSAGE_SIZE);
@@ -196,7 +219,9 @@ impl StreamingInner {
                 )));
             }
 
-            self.buf.reserve(len);
+            self.receive_high.0 = self.receive_high.0.max(len);
+            self.receive_limit()?;
+            self.buf.prepare(len)?;
 
             self.state = State::ReadBody {
                 compression: compression_encoding,
@@ -212,11 +237,11 @@ impl StreamingInner {
             }
 
             let decode_buf = if let Some(encoding) = compression {
-                self.decompress_buf.clear();
+                self.decompress_buf.bytes.clear();
                 let limit = self
                     .max_message_size
                     .unwrap_or(DEFAULT_MAX_RECV_MESSAGE_SIZE);
-                let limited_out_buf = (&mut self.decompress_buf).limit(limit);
+                self.decompress_buf.set_limit(limit);
 
                 if let Err(err) = decompress(
                     CompressionSettings {
@@ -224,7 +249,8 @@ impl StreamingInner {
                         buffer_growth_interval: buffer_settings.buffer_size,
                     },
                     &mut self.buf,
-                    limited_out_buf,
+                    &mut self.decompress_buf,
+                    limit,
                     len,
                 ) {
                     if matches!(err.kind(), std::io::ErrorKind::WriteZero) {
@@ -278,7 +304,10 @@ impl StreamingInner {
         };
 
         Poll::Ready(if frame.is_data() {
-            self.buf.put(frame.into_data().unwrap());
+            let bytes = frame.into_data().unwrap();
+            self.receive_high.1 = self.receive_high.1.max(bytes.len());
+            self.receive_limit()?;
+            append(&mut self.buf, bytes)?;
             Ok(Some(()))
         } else if frame.is_trailers() {
             if let Some(trailers) = &mut self.trailers {

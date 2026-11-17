@@ -1,21 +1,23 @@
+use super::budget::Buffer;
+use crate::Status;
 use bytes::buf::UninitSlice;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes};
 
 /// A specialized buffer to decode gRPC messages from.
 #[derive(Debug)]
 pub struct DecodeBuf<'a> {
-    buf: &'a mut BytesMut,
+    buf: &'a mut Buffer,
     len: usize,
 }
 
 /// A specialized buffer to encode gRPC messages into.
 #[derive(Debug)]
 pub struct EncodeBuf<'a> {
-    buf: &'a mut BytesMut,
+    buf: &'a mut Buffer,
 }
 
 impl<'a> DecodeBuf<'a> {
-    pub(crate) fn new(buf: &'a mut BytesMut, len: usize) -> Self {
+    pub(crate) fn new(buf: &'a mut Buffer, len: usize) -> Self {
         DecodeBuf { buf, len }
     }
 }
@@ -40,7 +42,7 @@ impl Buf for DecodeBuf<'_> {
     #[inline]
     fn advance(&mut self, cnt: usize) {
         assert!(cnt <= self.len);
-        self.buf.advance(cnt);
+        self.buf.bytes.advance(cnt);
         self.len -= cnt;
     }
 
@@ -48,12 +50,13 @@ impl Buf for DecodeBuf<'_> {
     fn copy_to_bytes(&mut self, len: usize) -> Bytes {
         assert!(len <= self.len);
         self.len -= len;
-        self.buf.copy_to_bytes(len)
+        assert!(!self.buf.guarded(), "guarded decoder owns message copying");
+        self.buf.bytes.copy_to_bytes(len)
     }
 }
 
 impl<'a> EncodeBuf<'a> {
-    pub(crate) fn new(buf: &'a mut BytesMut) -> Self {
+    pub(crate) fn new(buf: &'a mut Buffer) -> Self {
         EncodeBuf { buf }
     }
 }
@@ -66,24 +69,44 @@ impl EncodeBuf<'_> {
     /// reallocations. A call to `reserve` may result in an allocation.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
-        self.buf.reserve(additional);
+        self.require_room(additional);
+        self.buf.bytes.reserve(additional);
+    }
+
+    /// Prepare space before writing in a codec that opted into buffer admission.
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), Status> {
+        self.buf.prepare(additional)
+    }
+
+    fn require_room(&self, additional: usize) {
+        assert!(
+            !self.buf.guarded() || additional <= self.buf.capacity() - self.buf.len(),
+            "guarded encoder prepares its writes"
+        );
     }
 }
 
 unsafe impl BufMut for EncodeBuf<'_> {
     #[inline]
     fn remaining_mut(&self) -> usize {
-        self.buf.remaining_mut()
+        if self.buf.guarded() {
+            self.buf.capacity() - self.buf.len()
+        } else {
+            self.buf.bytes.remaining_mut()
+        }
     }
 
     #[inline]
     unsafe fn advance_mut(&mut self, cnt: usize) {
-        unsafe { self.buf.advance_mut(cnt) }
+        unsafe { self.buf.bytes.advance_mut(cnt) }
     }
 
     #[inline]
     fn chunk_mut(&mut self) -> &mut UninitSlice {
-        self.buf.chunk_mut()
+        if self.buf.guarded() && self.remaining_mut() == 0 {
+            return UninitSlice::new(&mut []);
+        }
+        self.buf.bytes.chunk_mut()
     }
 
     #[inline]
@@ -91,28 +114,32 @@ unsafe impl BufMut for EncodeBuf<'_> {
     where
         Self: Sized,
     {
-        self.buf.put(src)
+        self.require_room(src.remaining());
+        self.buf.bytes.put(src)
     }
 
     #[inline]
     fn put_slice(&mut self, src: &[u8]) {
-        self.buf.put_slice(src)
+        self.require_room(src.len());
+        self.buf.bytes.put_slice(src)
     }
 
     #[inline]
     fn put_bytes(&mut self, val: u8, cnt: usize) {
-        self.buf.put_bytes(val, cnt);
+        self.require_room(cnt);
+        self.buf.bytes.put_bytes(val, cnt);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::BufferKind;
 
     #[test]
     fn decode_buf() {
-        let mut payload = BytesMut::with_capacity(100);
-        payload.put(&vec![0u8; 50][..]);
+        let mut payload = Buffer::new(100, 100, BufferKind::Receive, None);
+        payload.bytes.put(&vec![0u8; 50][..]);
         let mut buf = DecodeBuf::new(&mut payload, 20);
 
         assert_eq!(buf.len, 20);
@@ -133,7 +160,7 @@ mod tests {
 
     #[test]
     fn encode_buf() {
-        let mut bytes = BytesMut::with_capacity(100);
+        let mut bytes = Buffer::new(100, 100, BufferKind::Send, None);
         let mut buf = EncodeBuf::new(&mut bytes);
 
         let initial = buf.remaining_mut();

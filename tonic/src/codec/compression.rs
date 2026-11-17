@@ -1,3 +1,4 @@
+use super::budget::{Buffer, Output};
 use crate::{Status, metadata::MetadataValue};
 use bytes::{Buf, BufMut, BytesMut};
 #[cfg(feature = "deflate")]
@@ -246,16 +247,16 @@ fn split_by_comma(s: &str) -> impl Iterator<Item = &str> {
 #[allow(unused_variables, unreachable_code)]
 pub(crate) fn compress(
     settings: CompressionSettings,
-    decompressed_buf: &mut BytesMut,
-    out_buf: &mut BytesMut,
+    decompressed_buf: &mut Buffer,
+    out_buf: &mut Buffer,
     len: usize,
 ) -> Result<(), std::io::Error> {
     let buffer_growth_interval = settings.buffer_growth_interval;
     let capacity = ((len / buffer_growth_interval) + 1) * buffer_growth_interval;
-    out_buf.reserve(capacity);
+    out_buf.prepare(capacity).map_err(std::io::Error::other)?;
 
     #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
-    let mut out_writer = out_buf.writer();
+    let mut out_writer = Output(out_buf, usize::MAX);
 
     match settings.encoding {
         #[cfg(feature = "gzip")]
@@ -287,7 +288,11 @@ pub(crate) fn compress(
         }
     }
 
-    decompressed_buf.advance(len);
+    if decompressed_buf.guarded() {
+        decompressed_buf.bytes.clear();
+    } else {
+        decompressed_buf.bytes.advance(len);
+    }
 
     Ok(())
 }
@@ -301,21 +306,27 @@ pub(crate) fn compress(
 #[allow(unused_variables, unreachable_code)]
 pub(crate) fn decompress(
     settings: CompressionSettings,
-    compressed_buf: &mut BytesMut,
-    mut out_buf: bytes::buf::Limit<&mut BytesMut>,
+    compressed_buf: &mut Buffer,
+    out_buf: &mut Buffer,
+    limit: usize,
     len: usize,
 ) -> Result<(), std::io::Error> {
     let buffer_growth_interval = settings.buffer_growth_interval;
     let estimate_decompressed_len = len * 2;
     let capacity = std::cmp::min(
-        bytes::buf::Limit::limit(&out_buf),
+        limit,
         ((estimate_decompressed_len / buffer_growth_interval) + 1) * buffer_growth_interval,
     );
 
-    out_buf.get_mut().reserve(capacity);
+    let state = out_buf
+        .budget()
+        .map(|budget| budget.decoder_state(settings.encoding))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    out_buf.prepare(capacity).map_err(std::io::Error::other)?;
 
     #[cfg(any(feature = "gzip", feature = "deflate", feature = "zstd"))]
-    let mut out_writer = out_buf.writer();
+    let mut out_writer = Output(out_buf, limit);
 
     match settings.encoding {
         #[cfg(feature = "gzip")]
@@ -339,7 +350,8 @@ pub(crate) fn decompress(
         }
     }
 
-    compressed_buf.advance(len);
+    drop(state);
+    compressed_buf.bytes.advance(len);
 
     Ok(())
 }
@@ -362,12 +374,18 @@ fn check_zstd_windows(mut input: &[u8]) -> std::io::Result<()> {
             zstd_sys::ZSTD_getFrameHeader(header.as_mut_ptr(), input.as_ptr().cast(), input.len())
         };
         if result != 0 {
-            return Err(Error::new(ErrorKind::InvalidData, "invalid zstd frame header"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "invalid zstd frame header",
+            ));
         }
         // SAFETY: the successful call above initialized the header.
         let header = unsafe { header.assume_init() };
         if header.windowSize > 1 << ZSTD_WINDOW_LOG {
-            return Err(Error::new(ErrorKind::InvalidData, "zstd frame window exceeds 8 MiB"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "zstd frame window exceeds 8 MiB",
+            ));
         }
         let size = find_frame_compressed_size(input)
             .ok()
@@ -514,15 +532,18 @@ mod tests {
             zstd::encode_all(data, 3).unwrap()
         }
         fn decode(encoding: CompressionEncoding, input: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-            let mut compressed = BytesMut::from(input);
-            let mut out = BytesMut::new();
+            let mut compressed =
+                Buffer::new(input.len(), 8192, super::super::BufferKind::Receive, None);
+            compressed.bytes.extend_from_slice(input);
+            let mut out = Buffer::new(0, 8192, super::super::BufferKind::Decompressed, None);
             decompress(
                 CompressionSettings {
                     encoding,
                     buffer_growth_interval: 8 * 1024,
                 },
                 &mut compressed,
-                (&mut out).limit(1024 * 1024),
+                &mut out,
+                1024 * 1024,
                 input.len(),
             )?;
             assert!(compressed.is_empty(), "the message's bytes are used");
@@ -571,16 +592,20 @@ mod tests {
             }
         }
         // The decompressed-size limit still refuses as the limit.
-        let mut compressed = BytesMut::from(&zlib(&large)[..]);
+        let encoded = zlib(&large);
+        let mut compressed =
+            Buffer::new(encoded.len(), 8192, super::super::BufferKind::Receive, None);
+        compressed.bytes.extend_from_slice(&encoded);
         let len = compressed.len();
-        let mut out = BytesMut::new();
+        let mut out = Buffer::new(0, 8192, super::super::BufferKind::Decompressed, None);
         let error = decompress(
             CompressionSettings {
                 encoding: CompressionEncoding::Deflate,
                 buffer_growth_interval: 8 * 1024,
             },
             &mut compressed,
-            (&mut out).limit(1024),
+            &mut out,
+            1024,
             len,
         )
         .unwrap_err();
