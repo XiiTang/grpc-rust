@@ -331,13 +331,50 @@ pub(crate) fn decompress(
         }
         #[cfg(feature = "zstd")]
         CompressionEncoding::Zstd => {
-            let mut zstd_decoder = Decoder::new(&compressed_buf[0..len])?;
+            let input = &compressed_buf[..len];
+            check_zstd_windows(input)?;
+            let mut zstd_decoder = Decoder::new(input)?;
+            zstd_decoder.window_log_max(ZSTD_WINDOW_LOG)?;
             std::io::copy(&mut zstd_decoder, &mut out_writer)?;
         }
     }
 
     compressed_buf.advance(len);
 
+    Ok(())
+}
+
+#[cfg(feature = "zstd")]
+const ZSTD_WINDOW_LOG: u32 = 23;
+
+/// Check each frame before the decoder can take its single-pass shortcut.
+#[cfg(feature = "zstd")]
+fn check_zstd_windows(mut input: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::mem::MaybeUninit;
+    use zstd::zstd_safe::{find_frame_compressed_size, zstd_sys};
+
+    while !input.is_empty() {
+        let mut header = MaybeUninit::uninit();
+        // SAFETY: input is a readable slice and header is writable storage.
+        // The library initializes header on return of zero.
+        let result = unsafe {
+            zstd_sys::ZSTD_getFrameHeader(header.as_mut_ptr(), input.as_ptr().cast(), input.len())
+        };
+        if result != 0 {
+            return Err(Error::new(ErrorKind::InvalidData, "invalid zstd frame header"));
+        }
+        // SAFETY: the successful call above initialized the header.
+        let header = unsafe { header.assume_init() };
+        if header.windowSize > 1 << ZSTD_WINDOW_LOG {
+            return Err(Error::new(ErrorKind::InvalidData, "zstd frame window exceeds 8 MiB"));
+        }
+        let size = find_frame_compressed_size(input)
+            .ok()
+            .filter(|size| *size != 0 && *size <= input.len())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "invalid zstd frame size"))?;
+        input = &input[size..];
+    }
     Ok(())
 }
 

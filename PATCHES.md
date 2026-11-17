@@ -80,3 +80,30 @@ message larger than one inflate chunk, and checks the size limit.
 `cargo test -p tonic --lib --features gzip,deflate,zstd -- codec::` (8 passed)
 and `cargo test -p compression` (63 passed) pass on macOS arm64. Retire when
 upstream checks that decoding used the whole message.
+
+## Bound the zstd receive window
+
+At the existing compressed-message checkpoint, read each frame header and
+extent using libzstd, and refuse a declared window greater than 8 MiB. Keep
+the streaming decoder's window log at 23 for its native history allocations.
+Upstream 0.14.6 uses the decoder's default window policy. In pinned libzstd
+1.5.7, the complete-frame shortcut at zstd_decompress.c:2185–2202 runs before
+the history-window check at :2231. A complete frame with a known decoded
+size can therefore finish within the caller's output space without the
+streaming check. The header check applies that same limit to each data frame,
+including a late frame in a concatenated message. The scan accepts RFC 8878
+Zstandard and skippable frames. Libzstd's streaming decoder can also read
+legacy v0.1–v0.7 frames when built with legacy support. Its standard header
+reader refuses them at this checkpoint, with the same framing outcome as an
+over-window frame. This matches the gRPC peer formats we support, including
+klauspost/compress's Go decoder. The policy is local to this checkpoint and
+leaves zstd-sys feature selection in place. The existing decompressor still
+validates complete data and the decoded-size cap. Refusal uses the same
+internal status as other invalid compressed data and Boundless
+maps it to its typed message-framing failure.
+
+Regression coverage: the Boundless gRPC receive fixture exercises accepted
+8 MiB and refused 16 MiB windows, including a single-pass-eligible frame and
+an over-window second frame. It also sends a complete v0.7 raw-block frame.
+The Program observes the framing failure without a message or a successful
+Status from the refused reply.
